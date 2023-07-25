@@ -64,7 +64,7 @@
 	url = https://github.com/ceph/cpp_redis.git
 [submodule "src/libkmip"]
 	path = src/libkmip
-	url = https://github.com/ceph/libkmip
+	url = https://github.com/leonid-s-usov/ceph-libkmip.git
 	branch = ceph-master
 [submodule "src/arrow"]
 	path = src/arrow
