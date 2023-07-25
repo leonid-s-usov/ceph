@@ -133,4 +133,16 @@ inline void for_each(std::tuple<Ts...>& t, F& f) {
 }
 }
 
+// This template is for the case when the standard library
+// doesn't provide a three way comparison for basic_string
+// e.g. clang with the macOs SDK
+template <typename CharT, typename Traits, typename Alloc>
+  requires (!requires (std::basic_string<CharT, Traits, Alloc> s){ s.operator<=>(s); })
+inline auto operator<=>(
+  const std::basic_string<CharT, Traits, Alloc> &__lhs,
+  const std::basic_string<CharT, Traits, Alloc> &__rhs)
+{
+  return __lhs.compare(__rhs) <=> 0;
+}
+
 #endif // CEPH_COMMON_CONVENIENCE_H

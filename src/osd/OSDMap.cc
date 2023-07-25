@@ -6188,14 +6188,14 @@ int OSDMap::calc_read_balance_score(CephContext *cct, int64_t pool_id,
       osd_pa_count++;
     }
     if (prim_pgs_by_osd.count(osd)) {
-      auto n_prims = prim_pgs_by_osd.at(osd).size();
+      uint64_t n_prims = prim_pgs_by_osd.at(osd).size();
       max_prims_per_osd = std::max(max_prims_per_osd, n_prims);
       if (osd_pa == 0.) {
         prim_on_zero_pa = true;
       }
     }
     if (acting_prims_by_osd.count(osd)) {
-      auto n_aprims = acting_prims_by_osd.at(osd).size();
+      uint64_t n_aprims = acting_prims_by_osd.at(osd).size();
       max_acting_prims_per_osd = std::max(max_acting_prims_per_osd, n_aprims);
       if (osd_pa != 0.) {
         max_osd_score = std::max(max_osd_score, float(n_aprims) / osd_pa);
