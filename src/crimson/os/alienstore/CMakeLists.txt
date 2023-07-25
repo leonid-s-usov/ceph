@@ -73,14 +73,15 @@ add_library(crimson-alienstore STATIC
 if(WITH_LTTNG)
   add_dependencies(crimson-alienstore bluestore-tp)
 endif()
+
 target_link_libraries(crimson-alienstore
   PRIVATE
-    alien::cflags
-    ${FMT_LIB}
-    kv
-    heap_profiler
-    crimson-alien-common
-    ${BLKID_LIBRARIES}
-    ${UDEV_LIBRARIES}
-    crimson
-    blk)
+  alien::cflags
+  ${FMT_LIB}
+  kv
+  heap_profiler
+  crimson-alien-common
+  ${BLKID_LIBRARIES}
+  ${UDEV_LIBRARIES}
+  crimson
+  $<$<TARGET_EXISTS:blk>:blk>)
