@@ -9,7 +9,7 @@ cd t
 tar xzf ../linux.tar.gz
 cd linux*
 make defconfig
-make -j`grep -c processor /proc/cpuinfo`
+make -j20
 cd ..
 if ! rm -rv linux* ; then
     echo "uh oh rm -r failed, it left behind:"
