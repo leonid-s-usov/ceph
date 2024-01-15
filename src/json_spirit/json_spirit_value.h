@@ -51,6 +51,7 @@ namespace json_spirit
         Value_impl( const Array&       value );
         Value_impl( bool               value );
         Value_impl( int                value );
+        Value_impl( long               value );
         Value_impl( boost::int64_t     value );
         Value_impl( boost::uint64_t    value );
         Value_impl( double             value );
@@ -292,6 +293,12 @@ namespace json_spirit
     template< class Config >
     Value_impl< Config >::Value_impl( int value )
     :   v_( static_cast< boost::int64_t >( value ) )
+    {
+    }
+
+    template < class Config >
+    Value_impl< Config >::Value_impl( long value )
+    : v_( static_cast< boost::int64_t >( value ) )
     {
     }
 
