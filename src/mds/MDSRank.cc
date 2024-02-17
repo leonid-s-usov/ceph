@@ -2636,6 +2636,8 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "ops") {
     vector<string> flags;
     cmd_getval(cmdmap, "flags", flags);
+    string path;
+    cmd_getval(cmdmap, "path", path);
     std::unique_lock l(mds_lock, std::defer_lock);
     auto lambda = OpTracker::default_dumper;
     if (flags.size()) {
@@ -2650,8 +2652,18 @@ void MDSRankDispatcher::handle_asok_command(
       };
       l.lock();
     }
-    if (!op_tracker.dump_ops_in_flight(f, false, {""}, false, lambda)) {
-      *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
+    if (!path.empty()) {
+      auto ff = JSONFormatterFile(path, false);
+      if (!op_tracker.dump_ops_in_flight(&ff, false, {""}, false, lambda)) {
+        *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
+      }
+      f->open_object_section("result");
+      f->dump_string("path", path);
+      f->close_section();
+    } else {
+      if (!op_tracker.dump_ops_in_flight(f, false, {""}, false, lambda)) {
+        *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
+      }
     }
   } else if (command == "dump_blocked_ops") {
     if (!op_tracker.dump_ops_in_flight(f, true)) {
