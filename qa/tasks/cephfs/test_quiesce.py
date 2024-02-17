@@ -8,6 +8,7 @@ import unittest
 from io import StringIO
 import os.path
 from time import sleep
+import errno
 
 from teuthology.contextutil import safe_while
 
@@ -457,7 +458,9 @@ class TestQuiesce(QuiesceTestCase):
         log.debug(f"op2 = {op2}")
         self.assertIn(op1['flag_point'], (self.FP_QUIESCE_COMPLETE, 'cleaned up request'))
         self.assertIn(op2['flag_point'], (self.FP_QUIESCE_COMPLETE, 'cleaned up request'))
-        self.assertTrue(op1['result'] == -115 or op2['result'] == -115) # EINPROGRESS
+        self.assertTrue(op1['result'] == -errno.EINPROGRESS or op2['result'] == -errno.EINPROGRESS, 
+            'op1: {[result]}, op2: {[result]}, EINPROGRESS: {}'.format(op1, op2, errno.EINPROGRESS)
+        )
 
     def test_quiesce_blocked(self):
         """
