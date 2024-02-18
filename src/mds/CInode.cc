@@ -255,9 +255,9 @@ ostream& operator<<(ostream& out, const CInode& in)
     out << " " << in.filelock;
   if (!in.xattrlock.is_sync_and_unlocked())
     out << " " << in.xattrlock;
-  if (!in.versionlock.is_sync_and_unlocked())  
+  if (in.versionlock.is_locked())
     out << " " << in.versionlock;
-  if (!in.quiescelock.is_sync_and_unlocked())
+  if (in.quiescelock.is_locked())
     out << " " << in.quiescelock;
 
   // hack: spit out crap on which clients have caps
