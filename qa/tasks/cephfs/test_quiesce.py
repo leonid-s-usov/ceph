@@ -188,14 +188,6 @@ class QuiesceTestCase(CephFSTestCase):
         visited = set()
         locks_expected = set([
           "iquiesce",
-          "isnap",
-          "ipolicy",
-          "ifile",
-          "inest",
-          "idft",
-          "iauth",
-          "ilink",
-          "ixattr",
         ])
         for inode in cache:
             ino = inode['ino']
@@ -212,21 +204,9 @@ class QuiesceTestCase(CephFSTestCase):
                 for lock in op['type_data']['locks']:
                     lock_type = lock['lock']['type']
                     if lock_type == "iquiesce":
-                        if ino == root_ino:
-                            self.assertEqual(lock['flags'], 1)
-                            self.assertEqual(lock['lock']['state'], 'sync')
-                        else:
-                            self.assertEqual(lock['flags'], 4)
-                            self.assertEqual(lock['lock']['state'], 'xlock')
-                    elif lock_type == "isnap":
-                        self.assertEqual(lock['flags'], 1)
-                        self.assertEqual(lock['lock']['state'][:4], 'sync')
-                    elif lock_type == "ifile":
-                        self.assertEqual(lock['flags'], 1)
-                        self.assertEqual(lock['lock']['state'][:4], 'sync')
-                    elif lock_type in ("ipolicy", "inest", "idft", "iauth", "ilink", "ixattr"):
-                        self.assertEqual(lock['flags'], 1)
-                        self.assertEqual(lock['lock']['state'][:4], 'sync')
+                        self.assertEqual(lock['flags'], 4)
+                        self.assertEqual(lock['lock']['state'], 'lock')
+                        self.assertEqual(lock['lock']['num_xlocks'], 1)
                     else:
                         # no iflock
                         self.assertFalse(lock_type.startswith("i"))

@@ -51,6 +51,7 @@ public:
     mds_rank_t remote_auth_pinned = MDS_RANK_NONE;
   };
 
+
   // held locks
   struct LockOp {
     enum {

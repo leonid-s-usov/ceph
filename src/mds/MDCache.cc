@@ -16,6 +16,8 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <ranges>
+#include <array>
 #include <map>
 
 #include "MDCache.h"
@@ -13526,63 +13528,53 @@ void MDCache::dispatch_quiesce_inode(const MDRequestRef& mdr)
     mds->server->respond_to_request(mdr, -CEPHFS_ENOENT);
     return;
   }
-  const bool is_root = (mdr->get_filepath().get_ino() == mdr->get_filepath2().get_ino());
 
   dout(20) << __func__ << " " << *mdr << " quiescing " << *in << dendl;
 
 
-  {
-    /* Acquire authpins on `in` to prevent migrations after this rank considers
-     * it (and its children) quiesced.
-     */
-
-    MutationImpl::LockOpVec lov;
-    if (!mds->locker->acquire_locks(mdr, lov, nullptr, {in}, false, true)) {
-      return;
-    }
-  }
-
-  /* TODO: Consider:
-   *
-   *  rank0 is auth for /foo
-   *  rank1 quiesces /foo with no dirents in cache (and stops)
-   *  rank0 begins quiescing /foo
-   *  rank0 exports a dirfrag of /foo/bar to rank1 (/foo/bar is not authpinned by rank1 nor by rank0 (yet))
-   *  rank1 discovers relevant paths in /foo/bar
-   *  rank1 now has /foo/bar in cache and may issue caps / execute operations
-   *
-   * The solution is probably to have rank1 mark /foo has STATE_QUIESCED and reject export ops from rank0.
-   */
-
   if (in->is_auth()) {
-    /* Acquire rdlocks on anything which prevents writing.
-     *
-     * Because files are treated specially allowing multiple reader/writers, we
-     * need an xlock here to recall all write caps. This unfortunately means
-     * there can be no readers.
+    /* Acquire all caps-related locks to revoke unwanted caps
      *
      * The xlock on the quiescelock is important to prevent future requests
      * from blocking on other inode locks while holding path traversal locks.
      * See dev doc doc/dev/mds_internals/quiesce.rst for more details.
      */
-
     MutationImpl::LockOpVec lov;
-    lov.add_rdlock(&in->authlock);
-    lov.add_rdlock(&in->dirfragtreelock);
-    lov.add_rdlock(&in->filelock);
-    lov.add_rdlock(&in->linklock);
-    lov.add_rdlock(&in->nestlock);
-    lov.add_rdlock(&in->policylock);
-    // N.B.: NO xlock/wrlock on quiescelock; we need to allow access to mksnap/lookup
-    // This is an unfortunate inconsistency. It may be possible to circumvent
-    // this issue by having those ops acquire the quiscelock only if necessary.
-    if (is_root) {
-      lov.add_rdlock(&in->quiescelock);
-    } else {
-      lov.add_xlock(&in->quiescelock); /* !! */
-    }
-    lov.add_rdlock(&in->snaplock);
+    // take the quiesce lock and the first of the four capability releated locks
+    lov.add_xlock(&in->quiescelock); /* !! */
     lov.add_rdlock(&in->xattrlock);
+
+    if (!mds->locker->acquire_locks(mdr, lov, nullptr, { in }, false, true)) {
+      return;
+    }
+
+    // now we can test if this inode should be skipped
+    // don't take the projected inode because
+    // we should only care about the committed state
+    if (in->get_inode()->get_quiesce_block()) {
+      dout(10) << __func__ << " quiesce is blocked for this inode; dropping locks!" << dendl;
+      mdr->mark_event("quiesce blocked");
+      mds->locker->drop_locks(mdr.get());
+      /* keep authpins! */
+      qs.inc_inodes_blocked();
+      mdr->internal_op_finish->complete(0);
+      mdr->internal_op_finish = nullptr;
+      return;
+    }
+
+    // we are adding the rest of the rdlocks
+    // this is safe because we only take rdlocks for all four locks
+    // if any lock is attempted for wr or x, then quiesce lock would be
+    // injected automatically by the `acquire_locks` and we already hold
+    // that as xlock so those can't be holding any of the write locks to the below
+
+    // rdlock on the filelock is sufficient,
+    // because the REQ state for rd on LOCK_MIX and XCL on LOCK_EXCL
+    // aren't rdlockable. See SimpleLock::can_rdlock
+    lov.add_rdlock(&in->filelock);
+    lov.add_rdlock(&in->authlock);
+    lov.add_rdlock(&in->linklock);
+
     if (!mds->locker->acquire_locks(mdr, lov, nullptr, {in}, false, true)) {
       return;
     }
@@ -13593,16 +13585,49 @@ void MDCache::dispatch_quiesce_inode(const MDRequestRef& mdr)
     return;
   }
 
-  if (in->get_projected_inode()->get_quiesce_block()) {
-    dout(10) << __func__ << " quiesce is blocked for this inode; dropping locks!" << dendl;
-    mdr->mark_event("quiesce blocked");
-    mds->locker->drop_locks(mdr.get());
-    /* keep authpins! */
-    qs.inc_inodes_blocked();
-    mdr->internal_op_finish->complete(0);
-    mdr->internal_op_finish = nullptr;
-    return;
+  // since we're holding onto the quiesce lock,
+  // we don't need the other capabilities related locks anymore
+  // as the quiesce mask will prevent any non-shared capabilities from being issued
+  // see CInode::get_caps_quiesce_mask()
+  // we actually don't need to hold any other lock but the quiesce lock
+
+  MutationImpl::LockOpVec drop_ops;
+  std::ranges::copy_if(
+    mdr->locks,
+    std::back_inserter(drop_ops),
+    [&in](auto &&op) { return op.lock != &in->quiescelock; }
+  );
+
+  dout(20) << __func__ << "dropping locks: " << drop_ops << dendl;
+
+  for (auto op: drop_ops) {
+    mds->locker->drop_lock(mdr.get(), op.lock);
   }
+
+  // use the lambda for completion so that we don't have to go
+  // through the whole lock/drop story above
+  auto did_quiesce = new LambdaContext([in, mdr=mdr, &qs, mds = mds, func = __func__](int rc) {
+    /* do not respond/complete so locks are not lost, parent request will complete */
+    if (mdr->killed) {
+      dout(20) << func << " " << *mdr << " not dispatching killed " << *mdr << dendl;
+      return;
+    } else if (mdr->internal_op_finish == nullptr) {
+      dout(20) << func << " " << *mdr << " already finished quiesce" << dendl;
+      return;
+    }
+
+    if (in->is_auth()) {
+      dout(10) << func << " " << *mdr << " quiesce complete of " << *in << dendl;
+      mdr->mark_event("quiesce complete");
+    } else {
+      dout(10) << func << " " << *mdr << " non-auth quiesce complete of " << *in << dendl;
+      mdr->mark_event("quiesce complete for non-auth inode");
+    }
+
+    qs.inc_inodes_quiesced();
+    mdr->internal_op_finish->complete(rc);
+    mdr->internal_op_finish = nullptr;
+  });
 
   if (in->is_dir()) {
     for (auto& dir : in->get_dirfrags()) {
@@ -13614,15 +13639,16 @@ void MDCache::dispatch_quiesce_inode(const MDRequestRef& mdr)
       }
     }
     uint64_t count = 0;
-    MDSGatherBuilder gather(g_ceph_context, new C_MDS_RetryRequest(this, mdr));
+    MDSGatherBuilder gather(g_ceph_context, new MDSInternalContextWrapper(mds, did_quiesce));
     auto& qops = qrmdr->more()->quiesce_ops;
     for (auto& dir : in->get_dirfrags()) {
       for (auto& [dnk, dn] : *dir) {
-        auto* in = dn->get_projected_inode();
+        // don't take the projected linkage because
+        // we should only care about the committed state
+        auto in = dn->get_linkage()->inode;
         if (!in) {
           continue;
         }
-
         if (auto it = qops.find(in); it != qops.end()) {
           dout(25) << __func__ << ": existing quiesce metareqid: "  << it->second << dendl;
           if (auto reqit = active_requests.find(it->second); reqit != active_requests.end()) {
@@ -13658,19 +13684,7 @@ void MDCache::dispatch_quiesce_inode(const MDRequestRef& mdr)
     }
   }
 
-  if (in->is_auth()) {
-    dout(10) << __func__ << " " << *mdr << " quiesce complete of " << *in << dendl;
-    mdr->mark_event("quiesce complete");
-  } else {
-    dout(10) << __func__ << " " << *mdr << " non-auth quiesce complete of " << *in << dendl;
-    mdr->mark_event("quiesce complete for non-auth inode");
-  }
-
-  qs.inc_inodes_quiesced();
-  mdr->internal_op_finish->complete(0);
-  mdr->internal_op_finish = nullptr;
-
-  /* do not respond/complete so locks are not lost, parent request will complete */
+  did_quiesce->complete(0);
 }
 
 void MDCache::dispatch_quiesce_path(const MDRequestRef& mdr)
@@ -13740,7 +13754,6 @@ void MDCache::dispatch_quiesce_path(const MDRequestRef& mdr)
   } else if (auto& qops = mdr->more()->quiesce_ops; qops.count(diri) == 0) {
     MDRequestRef qimdr = request_start_internal(CEPH_MDS_OP_QUIESCE_INODE);
     qimdr->set_filepath(filepath(diri->ino()));
-    qimdr->set_filepath2(filepath(diri->ino())); /* is_root! */
     qimdr->internal_op_finish = new C_MDS_RetryRequest(this, mdr);
     qimdr->internal_op_private = qfinisher;
     qops[diri] = qimdr->reqid;

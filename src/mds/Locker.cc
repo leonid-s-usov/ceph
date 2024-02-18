@@ -248,6 +248,10 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
   if (auth_pin_freeze)
     mustpin.insert(auth_pin_freeze);
 
+  using LockOp = MutationImpl::LockOp;
+
+  std::unordered_map<MDSCacheObject*, unsigned> quiesce_op_flags;
+
   // xlocks
   bool need_quiescelock = !skip_quiesce;
   for (size_t i = 0; i < lov.size(); ++i) {
@@ -255,7 +259,16 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
     SimpleLock *lock = p.lock;
     MDSCacheObject *object = lock->get_parent();
     auto t = lock->get_type();
-
+  
+    if (t == CEPH_LOCK_IQUIESCE) {
+      quiesce_op_flags[object] = p.flags;
+      need_quiescelock = false;
+      // remove this lock from the vector,
+      // we'll add it back below
+      lov.erase(lov.begin() + i);
+      --i;
+      continue;
+    }
     if (p.is_xlock()) {
       if ((lock->get_type() == CEPH_LOCK_ISNAP ||
 	   lock->get_type() == CEPH_LOCK_IPOLICY) &&
@@ -316,10 +329,10 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
           case CEPH_LOCK_IQUIESCE:
             break;
           default:
-	    CInode *in = static_cast<CInode*>(object);
-            if (need_quiescelock) {
-              need_quiescelock = false;
-              lov.add_rdlock(&in->quiescelock, i + 1);
+            CInode* in = static_cast<CInode*>(object);
+            if (need_quiescelock && (lock->get_cap_shift() > 0)) {
+              dout(15) << "need shared quiesce lock for " << p << " on " << SimpleLock::get_lock_type_name(t) << " of " << in << dendl;
+              quiesce_op_flags[in] |= LockOp::WRLOCK;
             }
 	    if (!in->is_auth())
 	      continue;
@@ -347,19 +360,17 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
 		 << " in case we need to request a scatter" << dendl;
 	mustpin.insert(object);
       }
-      if (need_quiescelock && is_inode_lock(t) && t != CEPH_LOCK_IQUIESCE) {
-	CInode *in = static_cast<CInode*>(object);
-        lov.add_rdlock(&in->quiescelock, i + 1);
-        need_quiescelock = false;
+      if (need_quiescelock && (lock->get_cap_shift() > 0)) {
+        dout(15) << "need shared quiesce lock for " << p << " on " << SimpleLock::get_lock_type_name(t) << " of " << object << dendl;
+        quiesce_op_flags[object] |= LockOp::WRLOCK;
       }
     } else if (p.is_remote_wrlock()) {
       dout(20) << " must remote_wrlock on mds." << p.wrlock_target << " "
 	       << *lock << " " << *object << dendl;
       mustpin.insert(object);
-      if (need_quiescelock && is_inode_lock(t) && t != CEPH_LOCK_IQUIESCE) {
-	CInode *in = static_cast<CInode*>(object);
-        lov.add_rdlock(&in->quiescelock, i + 1);
-        need_quiescelock = false;
+      if (need_quiescelock && (lock->get_cap_shift() > 0)) {
+        dout(15) << "need shared quiesce lock for " << p << " on " << SimpleLock::get_lock_type_name(t) << " of " << object << dendl;
+        quiesce_op_flags[object] |= LockOp::WRLOCK;
       }
     } else if (p.is_rdlock()) {
       dout(20) << " must rdlock " << *lock << " " << *object << dendl;
@@ -385,26 +396,46 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
        * xlocked, then all locks are dropped (s.f.
        * Locker::handle_quiesce_failure). So adding the quiescelock can never
        * contribute to deadlock.
+       * 
+       * UPD - we can further simplify and say that no read operation
+       * should be taking the quiesce lock. We'll have to handle it a bit 
+       * differently when we decide to implement an exclusive quiesce
        */
 
-      if (need_quiescelock && !mdr->is_rdlocked(lock)) {
-        /* Can we get the lock without waiting? */
-        if (!lock->can_rdlock(client)) {
-          /* To prevent deadlock where an op holds a parent snaplock
-           * (Locker::try_rdlock_snap_layout), add quiescelock.
-           */
-	  CInode *in = static_cast<CInode*>(object);
-          lov.add_rdlock(&in->quiescelock, i + 1);
-          need_quiescelock = false;
-        }
-      }
+      //       if (need_quiescelock && !mdr->is_rdlocked(lock) && (lock->get_cap_shift() > 0)) {
+      //         /* Can we get the lock without waiting? */
+      //         if (!lock->can_rdlock(client)) {
+      //           /* To prevent deadlock where an op holds a parent snaplock
+      //            * (Locker::try_rdlock_snap_layout), add quiescelock.
+      //            */
+      //           quiesce_op_flags[object] |= LockOp::WRLOCK;
+      //         }
+      //       }
     } else {
       ceph_assert(0 == "locker unknown lock operation");
     }
   }
 
   lov.sort_and_merge();
- 
+
+  bool injected_quiesce_lock = false;
+  for (auto &[co, flags]: quiesce_op_flags){
+    CInode *in = static_cast<CInode*>(co);
+    if (flags & LockOp::XLOCK) {
+      dout(15) << "injecting an exclusive quiesce lock for inode " << in << " under mdr: " << mdr << dendl;
+      lov.add_xlock(&in->quiescelock, 0);
+      injected_quiesce_lock = true;
+    } else if (flags & LockOp::WRLOCK) {
+      dout(15) << "injecting a shared quiesce lock for inode " << in << " under mdr: " << mdr << dendl;
+      lov.add_wrlock(&in->quiescelock, 0);
+      injected_quiesce_lock = true;
+    }
+  }
+
+  if (!injected_quiesce_lock) {
+    dout(20) << "no quiesce lock taken for mdr: " << mdr << dendl;
+  }
+
   // AUTH PINS
   map<mds_rank_t, set<MDSCacheObject*> > mustpin_remote;  // mds -> (object set)
   
@@ -575,11 +606,7 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
       if (mdr->locking && lock != mdr->locking)
 	cancel_locking(mdr.get(), &issue_set);
       if (!xlock_start(lock, mdr)) {
-        if (t == CEPH_LOCK_IQUIESCE) {
-          handle_quiesce_failure(mdr, marker.message);
-        } else {
-	  marker.message = "failed to xlock, waiting";
-        }
+	marker.message = "failed to xlock, waiting";
 	goto out;
       }
       dout(10) << " got xlock on " << *lock << " " << *lock->get_parent() << dendl;
@@ -655,11 +682,8 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
       }
 
       if (!rdlock_start(lock, mdr)) {
-        if (t == CEPH_LOCK_IQUIESCE) {
-          handle_quiesce_failure(mdr, marker.message);
-        } else {
-	  marker.message = "failed to rdlock, waiting";
-        }
+        ceph_assert(t != CEPH_LOCK_IQUIESCE); // rdlock is undefined for LocalLock
+        marker.message = "failed to rdlock, waiting";
 	goto out;
       }
       dout(10) << " got rdlock on " << *lock << " " << *lock->get_parent() << dendl;
@@ -865,7 +889,7 @@ void Locker::drop_rdlocks_for_early_reply(MutationImpl *mut)
   issue_caps_set(need_issue);
 }
 
-void Locker::drop_rdlock(MutationImpl* mut, SimpleLock* what)
+void Locker::drop_lock(MutationImpl* mut, SimpleLock* what)
 {
   dout(20) << __func__ << ": " << *what << dendl;
 
@@ -873,9 +897,14 @@ void Locker::drop_rdlock(MutationImpl* mut, SimpleLock* what)
     auto* lock = it->lock;
     if (lock == what) {
       dout(20) << __func__ << ": found lock " << *lock << dendl;
-      ceph_assert(it->is_rdlock());
       bool ni = false;
-      rdlock_finish(it, mut, &ni);
+      if (it->is_xlock()) {
+        xlock_finish(it, mut, &ni);
+      } else if (it->is_wrlock()) {
+        wrlock_finish(it, mut, &ni);
+      } else if (it->is_rdlock()) {
+        rdlock_finish(it, mut, &ni);
+      }
       if (ni) {
         set<CInode*> need_issue;
         need_issue.insert(static_cast<CInode*>(lock->get_parent()));
@@ -1450,8 +1479,7 @@ bool Locker::eval(CInode *in, int mask, bool caps_imported)
     eval_any(&in->flocklock, &need_issue, &finishers, caps_imported);
   if (mask & CEPH_LOCK_IPOLICY)
     eval_any(&in->policylock, &need_issue, &finishers, caps_imported);
-  if (mask & CEPH_LOCK_IQUIESCE)
-    eval_any(&in->quiescelock, &need_issue, &finishers, caps_imported);
+  // LocalLocks should not be eval'd
 
   // drop loner?
   if (in->is_auth() && in->is_head() && in->get_wanted_loner() != in->get_loner()) {
@@ -1841,6 +1869,7 @@ void Locker::wrlock_force(SimpleLock *lock, MutationRef& mut)
   switch  (lock->get_type()) {
     case CEPH_LOCK_DVERSION:
     case CEPH_LOCK_IVERSION:
+    case CEPH_LOCK_IQUIESCE:
       return local_wrlock_grab(static_cast<LocalLockC*>(lock), mut);
     default:
       break;
@@ -1892,6 +1921,7 @@ bool Locker::wrlock_start(const MutationImpl::LockOp &op, const MDRequestRef& mu
   switch  (lock->get_type()) {
     case CEPH_LOCK_DVERSION:
     case CEPH_LOCK_IVERSION:
+    case CEPH_LOCK_IQUIESCE:
       return local_wrlock_start(static_cast<LocalLockC*>(lock), mut);
     default:
       break;
@@ -1957,6 +1987,7 @@ void Locker::wrlock_finish(const MutationImpl::lock_iterator& it, MutationImpl *
   switch  (lock->get_type()) {
     case CEPH_LOCK_DVERSION:
     case CEPH_LOCK_IVERSION:
+    case CEPH_LOCK_IQUIESCE:
       return local_wrlock_finish(it, mut);
     default:
       break;
@@ -2045,6 +2076,7 @@ bool Locker::xlock_start(SimpleLock *lock, const MDRequestRef& mut)
   switch  (lock->get_type()) {
     case CEPH_LOCK_DVERSION:
     case CEPH_LOCK_IVERSION:
+    case CEPH_LOCK_IQUIESCE:
       return local_xlock_start(static_cast<LocalLockC*>(lock), mut);
     default:
       break;
@@ -2171,6 +2203,7 @@ void Locker::xlock_finish(const MutationImpl::lock_iterator& it, MutationImpl *m
   switch  (lock->get_type()) {
     case CEPH_LOCK_DVERSION:
     case CEPH_LOCK_IVERSION:
+    case CEPH_LOCK_IQUIESCE:
       return local_xlock_finish(it, mut);
     default:
       break;
@@ -2981,10 +3014,13 @@ bool Locker::check_inode_max_size(CInode *in, bool force_wrlock,
   } else if (!force_wrlock && !in->filelock.can_wrlock(in->get_loner())) {
     // lock?
     if (in->filelock.is_stable()) {
-      if (in->get_target_loner() >= 0)
-	file_excl(&in->filelock);
-      else
-	simple_lock(&in->filelock);
+      auto wanted = in->get_caps_wanted();
+      if (in->get_target_loner() >= 0 && (wanted & CEPH_CAP_ANY_FILE_WR)) {
+        dout(10) << "check_inode_max_size requesting file_excl for wanted caps " << ccap_string(wanted) << " " << *in << dendl;
+        file_excl(&in->filelock);
+      } else {
+        simple_lock(&in->filelock);
+      }
     }
     if (!in->filelock.can_wrlock(in->get_loner())) {
       dout(10) << "check_inode_max_size can't wrlock, waiting on " << *in << dendl;
@@ -3965,7 +4001,7 @@ bool Locker::_do_cap_update(CInode *in, Capability *cap,
   if (in->is_file()) {
     bool forced_change_max = false;
     dout(20) << "inode is file" << dendl;
-    if (cap && ((cap->issued() | cap->wanted()) & CEPH_CAP_ANY_FILE_WR)) {
+    if (cap && ((cap->issued() | cap->wanted()) & CEPH_CAP_ANY_FILE_WR & in->get_caps_quiesce_mask())) {
       dout(20) << "client has write caps; m->get_max_size="
                << m->get_max_size() << "; old_max=" << old_max << dendl;
       if (m->get_max_size() > new_max) {
@@ -5548,6 +5584,12 @@ void Locker::local_xlock_finish(const MutationImpl::lock_iterator& it, MutationI
   lock->put_xlock();
   mut->locks.erase(it);
 
+  if (lock->get_type() == CEPH_LOCK_IQUIESCE) {
+    auto in = static_cast<CInode*>(lock->get_parent());
+    // reevaluate everything related related to caps
+    eval(in, CEPH_LOCK_IFILE | CEPH_LOCK_IAUTH | CEPH_LOCK_ILINK | CEPH_LOCK_IXATTR, true);
+  }
+
   lock->finish_waiters(SimpleLock::WAIT_STABLE | 
 		       SimpleLock::WAIT_WR | 
 		       SimpleLock::WAIT_RD);
@@ -5593,7 +5635,7 @@ void Locker::file_eval(ScatterLock *lock, bool *need_issue)
             << " other_issued=" << gcap_string(other_issued)
 	    << " xlocker_issued=" << gcap_string(xlocker_issued)
 	    << dendl;
-    if (!((loner_wanted|loner_issued) & (CEPH_CAP_GEXCL|CEPH_CAP_GWR|CEPH_CAP_GBUFFER)) ||
+    if (!((loner_wanted|loner_issued) & (CEPH_CAP_ANY_FILE_WR >> CEPH_CAP_SFILE)) ||
 	(other_wanted & (CEPH_CAP_GEXCL|CEPH_CAP_GWR|CEPH_CAP_GRD)) ||
 	(in->is_dir() && in->multiple_nonstale_caps())) {  // FIXME.. :/
       dout(20) << " should lose it" << dendl;
@@ -5626,7 +5668,7 @@ void Locker::file_eval(ScatterLock *lock, bool *need_issue)
 	   in->get_target_loner() >= 0 &&
 	   (in->is_dir() ?
 	    !in->has_subtree_or_exporting_dirfrag() :
-	    (wanted & (CEPH_CAP_GEXCL|CEPH_CAP_GWR|CEPH_CAP_GBUFFER)))) {
+	    (wanted & (CEPH_CAP_ANY_FILE_WR >> CEPH_CAP_SFILE)))) {
     dout(7) << "file_eval stable, bump to loner " << *lock
 	    << " on " << *lock->get_parent() << dendl;
     file_excl(lock, need_issue);
