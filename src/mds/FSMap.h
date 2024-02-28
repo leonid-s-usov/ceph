@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <errno.h>
 
@@ -451,9 +452,23 @@ public:
   void modify_filesystem(fs_cluster_id_t fscid, T&& fn)
   {
     auto& fs = filesystems.at(fscid);
-    fn(fs);
-    fs->mds_map.epoch = epoch;
+    bool did_update = true;
+
+    if constexpr (std::is_convertible_v<std::invoke_result_t<T, Filesystem::ref>, bool>) {
+      did_update = fn(fs);
+    } else {
+      fn(fs);
+    }
+    
+    if (did_update) {
+      fs->mds_map.epoch = epoch;
+    }
   }
+
+  /* This is method is written for the option of "ceph fs swap" commmand
+   * that intiates swap of FSCIDs.
+   */
+  void swap_fscids(fs_cluster_id_t fscid1, fs_cluster_id_t fscid2);
 
   /**
    * Apply a mutation to the mds_info_t structure for a particular
