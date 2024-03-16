@@ -34,10 +34,6 @@ class ThrasherGreenlet(Thrasher, Greenlet):
     def stop(self):
         self._should_stop_event.set()
 
-    def set_thrasher_exception(self, e):
-        if not isinstance(e, self.Stopped):
-            super(ThrasherGreenlet, self).set_thrasher_exception(e)
-
     def proceed_unless_stopped(self):
         self.sleep_unless_stopped(0, raise_stopped=True)
 
@@ -45,3 +41,4 @@ class ThrasherGreenlet(Thrasher, Greenlet):
         self._should_stop_event.wait(seconds)
         if self.is_stopped and raise_stopped:
             raise self.Stopped()
+        return not self.is_stopped
